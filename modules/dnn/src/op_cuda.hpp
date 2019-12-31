@@ -7,6 +7,7 @@
 
 #ifdef HAVE_CUDA
 #include "cuda4dnn/csl/stream.hpp"
+#include "cuda4dnn/csl/event.hpp"
 #include "cuda4dnn/csl/cublas.hpp"
 #include "cuda4dnn/csl/cudnn.hpp"
 #include "cuda4dnn/csl/tensor.hpp"
@@ -206,16 +207,18 @@ namespace cv { namespace dnn {
         virtual ~CUDABackendWrapper() { }
 
         void copyToHost() override = 0;
+        virtual void copyToHostInBackground() = 0;
         void setHostDirty() override = 0;
 
         virtual void copyToDevice() = 0;
+        virtual void copyToDeviceInBackground() = 0;
         virtual void setDeviceDirty() = 0;
 
         virtual MatShape getShape() const noexcept = 0;
         virtual std::size_t getRank() const noexcept = 0;
 
         /** @note setting the stream updates the stream for all wrappers which use the same tensor */
-        virtual void setStream(cuda4dnn::csl::Stream stream) noexcept = 0;
+        virtual void setStream(cuda4dnn::csl::Stream stream, cuda4dnn::csl::Stream h2d_stream, cuda4dnn::csl::Stream d2h_stream) noexcept = 0;
 
         virtual void update(const MatShape& shape, std::size_t offset) = 0;
     };
@@ -349,6 +352,31 @@ namespace cv { namespace dnn {
 
                 cuda4dnn::detail::convert_D2H<T>(mat, view, shared_block->device_temp, shared_block->stream);
                 shared_block->stream.synchronize();
+            } else if(shared_block->d2h_event && shared_block->d2h_event.busy()) {
+                /* wait for the background copy to finish */
+                shared_block->d2h_event.synchronize();
+            }
+        }
+
+        void copyToHostInBackground() override {
+            CV_Assert(shared_block->d2h_stream);
+            if (shared_block->device_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                if (!shared_block->d2h_event)
+                    shared_block->d2h_event = cuda4dnn::csl::Event(true);
+                shared_block->d2h_event.record(shared_block->stream);
+                cuda4dnn::csl::StreamWaitOnEvent(shared_block->d2h_stream, shared_block->d2h_event);
+
+                auto view = tensor_view_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+
+                auto& mat = shared_block->host;
+                CV_Assert(mat.isContinuous());
+                CV_Assert(mat.type() == CV_32F);
+
+                cuda4dnn::detail::convert_D2H<T>(mat, view, shared_block->device_temp, shared_block->d2h_stream);
+                shared_block->d2h_event.record(shared_block->d2h_stream);
             }
         }
 
@@ -371,6 +399,30 @@ namespace cv { namespace dnn {
                 CV_Assert(mat.type() == CV_32F);
 
                 cuda4dnn::detail::convert_H2D<T>(span, mat, shared_block->device_temp, shared_block->stream);
+            } else if(shared_block->h2d_event && shared_block->h2d_event.busy()) {
+                cuda4dnn::csl::StreamWaitOnEvent(shared_block->stream, shared_block->h2d_event);
+            }
+        }
+
+        void copyToDeviceInBackground() override {
+            CV_Assert(shared_block->h2d_stream);
+            if (shared_block->host_dirty) {
+                shared_block->host_dirty = false;
+                shared_block->device_dirty = false;
+
+                if (!shared_block->h2d_event)
+                    shared_block->h2d_event = cuda4dnn::csl::Event(true);
+                shared_block->h2d_event.record(shared_block->stream);
+                cuda4dnn::csl::StreamWaitOnEvent(shared_block->h2d_stream, shared_block->h2d_event);
+
+                auto span = tensor_span_type(shared_block->device.get(), std::begin(shape), std::end(shape));
+
+                auto& mat = shared_block->host;
+                CV_Assert(mat.isContinuous());
+                CV_Assert(mat.type() == CV_32F);
+
+                cuda4dnn::detail::convert_H2D<T>(span, mat, shared_block->device_temp, shared_block->h2d_stream);
+                shared_block->h2d_event.record(shared_block->h2d_stream);
             }
         }
 
@@ -383,8 +435,10 @@ namespace cv { namespace dnn {
 
         std::size_t getRank() const noexcept override { return shape.size(); }
 
-        void setStream(cuda4dnn::csl::Stream stream) noexcept override {
+        void setStream(cuda4dnn::csl::Stream stream, cuda4dnn::csl::Stream h2d_stream, cuda4dnn::csl::Stream d2h_stream) noexcept override {
             shared_block->stream = std::move(stream);
+            shared_block->h2d_stream = std::move(h2d_stream);
+            shared_block->d2h_stream = std::move(d2h_stream);
         }
 
         void update(const MatShape& shape_, std::size_t offset_) override {
@@ -452,6 +506,9 @@ namespace cv { namespace dnn {
             cuda4dnn::csl::ManagedPtr<T> device;
             cuda4dnn::csl::ManagedPtr<float> device_temp; /* use for conversions */
             cuda4dnn::csl::Stream stream;
+
+            cuda4dnn::csl::Event h2d_event, d2h_event;
+            cuda4dnn::csl::Stream h2d_stream, d2h_stream;
         };
 
         std::shared_ptr<shared_block_type> shared_block;
