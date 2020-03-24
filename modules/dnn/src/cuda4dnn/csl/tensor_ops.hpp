@@ -177,6 +177,66 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl {
             outputTensorDesc = TensorDescriptor(output_dims);
 
             algo = ConvolutionAlgorithm(cudnnHandle, convDesc, filterDesc, inputTensorDesc, outputTensorDesc);
+
+            auto get_algo = [&](cudnnConvolutionFwdAlgo_t algoc)->std::string {
+                switch(algoc) {
+                    case CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM:          return "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_GEMM        ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM:  return "CUDNN_CONVOLUTION_FWD_ALGO_IMPLICIT_PRECOMP_GEMM";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_GEMM:                   return "CUDNN_CONVOLUTION_FWD_ALGO_GEMM                 ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_DIRECT:                 return "CUDNN_CONVOLUTION_FWD_ALGO_DIRECT               ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_FFT:                    return "CUDNN_CONVOLUTION_FWD_ALGO_FFT                  ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING:             return "CUDNN_CONVOLUTION_FWD_ALGO_FFT_TILING           ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD:               return "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD             ";
+                    case CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED:      return "CUDNN_CONVOLUTION_FWD_ALGO_WINOGRAD_NONFUSED    ";
+                }
+
+                return "";
+            };
+
+            cudnnConvolutionFwdAlgoPerf_t perfResults[100];
+            int returnedAlgoCount;
+            CUDA4DNN_CHECK_CUDNN(cudnnFindConvolutionForwardAlgorithm(
+                cudnnHandle.get(),
+                inputTensorDesc.get(),
+                filterDesc.get(),
+                convDesc.get(),
+                outputTensorDesc.get(),
+                100,
+                &returnedAlgoCount,
+                perfResults));
+
+            cudnnConvolutionFwdAlgo_t best_algo;
+            float best_time = 1e10;
+            for (int i = 0; i < returnedAlgoCount; i++)
+            {
+                try {
+                    CUDA4DNN_CHECK_CUDNN(perfResults[i].status);
+                    if (best_time > perfResults[i].time)
+                    {
+                        best_time = perfResults[i].time;
+                        best_algo = perfResults[i].algo;
+                    }
+                } catch(...) {
+                }
+            }
+
+            std::cout << "Convolution Profile:\n";
+            std::cout << "\tHeuristic:      " << get_algo(algo.get()) << std::endl;
+            std::cout << "\tBest Algorithm: " << get_algo(best_algo) << std::endl;
+            if (algo.get() != best_algo)
+                std::cout << "\tHeuristic failed\n";
+            std::cout << "\tProfling results:\n";
+            for (int i = 0; i < returnedAlgoCount; i++)
+            {
+                try {
+                    CUDA4DNN_CHECK_CUDNN(perfResults[i].status);
+                    std::cout << "\t\t" << get_algo(perfResults[i].algo) << " >> " <<
+                        "time: " << perfResults[i].time << "ms, " <<
+                        "\tmem: " << perfResults[i].memory / 1024 << "KB" << std::endl;
+                } catch(...) {
+                    std::cout << "\t\t" << get_algo(perfResults[i].algo) << " FAILED " << std::endl;
+                }
+            }
         }
 
         Convolution& operator=(const Convolution&) = delete;
