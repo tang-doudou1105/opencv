@@ -2,8 +2,8 @@
 // It is subject to the license terms in the LICENSE file found in the top-level directory
 // of this distribution and at http://opencv.org/license.html.
 
-#ifndef OPENCV_DNN_SRC_CUDA_GRID_STRIDE_RANGE_HPP
-#define OPENCV_DNN_SRC_CUDA_GRID_STRIDE_RANGE_HPP
+#ifndef OPENCV_DNN_SRC_CUDA_BLOCK_STRIDE_RANGE_HPP
+#define OPENCV_DNN_SRC_CUDA_BLOCK_STRIDE_RANGE_HPP
 
 #include "types.hpp"
 #include "index_helpers.hpp"
@@ -13,10 +13,10 @@
 namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace device {
 
 template <int dim, class index_type = device::index_type, class size_type = device::size_type>
-class grid_stride_range_generic {
+class block_stride_range_generic {
 public:
-    __device__ grid_stride_range_generic(index_type to_) : from(0), to(to_) { }
-    __device__ grid_stride_range_generic(index_type from_, index_type to_) : from(from_), to(to_) { }
+    __device__ block_stride_range_generic(index_type to_) : from(0), to(to_) { }
+    __device__ block_stride_range_generic(index_type from_, index_type to_) : from(from_), to(to_) { }
 
     class iterator
     {
@@ -29,7 +29,7 @@ public:
         __device__ index_type operator*() const { return pos; }
 
         __device__ iterator& operator++() {
-            pos += getGridDim<dim>() * static_cast<index_type>(getBlockDim<dim>());
+            pos += static_cast<index_type>(getBlockDim<dim>());
             return *this;
         }
 
@@ -47,7 +47,7 @@ public:
     };
 
     __device__ iterator begin() const {
-        return iterator(from + getBlockDim<dim>() * getBlockIdx<dim>() + getThreadIdx<dim>());
+        return iterator(from + getThreadIdx<dim>());
     }
 
     __device__ iterator end() const {
@@ -58,11 +58,11 @@ private:
     index_type from, to;
 };
 
-using grid_stride_range_x = grid_stride_range_generic<0>;
-using grid_stride_range_y = grid_stride_range_generic<1>;
-using grid_stride_range_z = grid_stride_range_generic<2>;
-using grid_stride_range = grid_stride_range_x;
+using block_stride_range_x = block_stride_range_generic<0>;
+using block_stride_range_y = block_stride_range_generic<1>;
+using block_stride_range_z = block_stride_range_generic<2>;
+using block_stride_range = block_stride_range_x;
 
 }}}}} /* namespace cv::dnn::cuda4dnn::csl::device */
 
-#endif /* OPENCV_DNN_SRC_CUDA_GRID_STRIDE_RANGE_HPP */
+#endif /* OPENCV_DNN_SRC_CUDA_BLOCK_STRIDE_RANGE_HPP */
