@@ -86,9 +86,11 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             builder.require<T>(config.batch_size * num_priors * num_classes); /* transposed scores */
             builder.require<int>(config.batch_size * num_classes * classwise_topK); /* indices */
             builder.require<int>(config.batch_size * num_classes); /* classwise topK count */
+            builder.require<T>(config.batch_size * num_classes * classwise_topK * 4); /* topK decoded boxes */
             builder.require<int>(config.batch_size * keepTopK); /* final kept indices */
             builder.require<int>(config.batch_size); /* kept indices count */
             builder.require<int>(1); /* total number of detections */
+
             scratch_mem_in_bytes = builder.required_workspace_size();
         }
 
@@ -189,7 +191,15 @@ namespace cv { namespace dnn { namespace cuda4dnn {
 
             kernels::findTopK<T>(stream, indices, count, scores_permuted, background_label_id, confidence_threshold);
 
-            kernels::blockwise_class_nms<T>(stream, indices, count, decoded_boxes, share_location, normalized_bbox, background_label_id, nms_threshold);
+            // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
+            csl::TensorSpan<T> collected_bboxes;
+            {
+                auto shape = std::vector<std::size_t>{batch_size, num_classes, classwise_topK, 4};
+                collected_bboxes = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
+            }
+            kernels::box_collect<T>(stream, collected_bboxes, decoded_boxes, indices, count, share_location, background_label_id);
+
+            kernels::blockwise_class_nms<T>(stream, indices, count, collected_bboxes, normalized_bbox, background_label_id, nms_threshold);
 
             // kept_indices: [batch_size, keepTopK]
             csl::TensorSpan<int> kept_indices;

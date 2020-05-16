@@ -149,13 +149,9 @@ namespace raw {
         }
     }
 
-    template <class T, std::size_t BINS>
+    template <class T, int BINS, int BLOCK_SIZE>
     __global__ void findTopK(Span<int> indices, Span<int> count, View<T> scores, float threshold, size_type classwise_topK, size_type num_classes, size_type num_priors, index_type background_label_id)
     {
-        // indices: [batch_size, num_classes, classwise_topK]
-        // count: [batch_size, num_classes]
-        // scores: [batch_size, num_classes, num_priors]
-
         /* We need to sort boxes based on their confidence scores. The confidence scores fall in
          * the range [0.0, 1.0]. We break the range into bins and perform count sort. This is an
          * approximate algorithm but it almost always selects the boxes which would have been
@@ -168,6 +164,15 @@ namespace raw {
         if (c == background_label_id)
             return;
 
+        // indices: [batch_size, num_classes, classwise_topK]
+        // count: [batch_size, num_classes]
+        // scores: [batch_size, num_classes, num_priors]
+
+        /* batch and class offset in the count, scores and indices array */
+        const auto count_offset = b * num_classes + c;
+        const auto scores_offset = (b * num_classes + c) * num_priors;
+        const auto indices_offset = (b * num_classes + c) * classwise_topK;
+
         /* We do not require a large number of bins to find the top K confidence scores. We will use
          * a reasonable number of bins which will fit in the shared memory.
          *
@@ -175,15 +180,17 @@ namespace raw {
          * ascending order.
          */
 
-        __shared__ unsigned int bins[BINS];
-        for (auto i : block_stride_range(BINS))
+        __shared__ int bins[BINS];
+
+        #pragma unroll (BINS / BLOCK_SIZE)
+        for (auto i : block_stride_range<BLOCK_SIZE>(BINS))
             bins[i] = 0;
 
         __syncthreads();
 
-        for (auto i : block_stride_range(num_priors))
+        for (auto i : block_stride_range<BLOCK_SIZE>(num_priors))
         {
-            const float confidence = load_ldg(scores[(b * num_classes + c) * num_priors + i]);
+            const float confidence = load_ldg(scores[scores_offset + i]);
             if (confidence > threshold)
             {
                 using device::fast_divide;
@@ -207,19 +214,20 @@ namespace raw {
          * one place to the left and then compute the suffix sum of the bins array. The reason will be
          * explained later.
          */
+        #pragma unroll (BINS / BLOCK_SIZE)
+        for (auto i : block_stride_range<BLOCK_SIZE>(BINS))
+        {
+            int temp = (i == BINS - 1) ? 0 : bins[i + 1];
+
+            static_assert(BINS % BLOCK_SIZE == 0); /* cannot have divergence while using __syncthreads */
+            __syncthreads();
+
+            bins[i] = temp;
+            // bins[i] won't be read again => no need for __syncthreads here
+        }
+
         if (threadIdx.x < warpSize)
         {
-            for (int i = threadIdx.x; i < BINS - 1; i += warpSize)
-            {
-                auto temp = bins[i + 1];
-                __syncwarp();
-                bins[i] = temp;
-                // bins[i] won't be read again => no need for __syncwarp here
-            }
-
-            if (threadIdx.x == 0)
-                bins[BINS - 1] = 0;
-
             /* We can compute suffix sum of an array in groups of N numbers.
              * Let N be 4 for this example.
              *
@@ -249,26 +257,32 @@ namespace raw {
              *
              * We use the aforementioned logic but work in groups of `warpSize`.
              */
-            constexpr int group_size = 32; /* must be equal to warpSize */
-            assert(group_size == warpSize);
 
-            /* Shuffle instructions cannot be used in warp-divergent code. If the bins are a multiple
+            constexpr int WARP_SIZE = 32; /* must be equal to warpSize */
+            // FORWARD_COMPATIBILITY_TAG: WARP_SIZE_DEPENDENT_CODE
+
+            /* We calculate suffix sums WARP_SIZE elements at a time starting from the right end.
+             * Hence, we will need BINS / WARP_SIZE number of iterations.
+             *
+             * Each iteration uses shuffle instructions to exchange data exchange between threads.
+             * Shuffle instructions cannot be used in warp-divergent code. If the bins are a multiple
              * of the warpSize, all the threads in the warp will participate and thereby safely make
              * use of shuffle instructions.
              */
-            static_assert(BINS % group_size == 0, "number of bins must be a multiple of warpSize");
+            static_assert(BINS % WARP_SIZE == 0, "number of bins must be a multiple of warp size");
 
-            const auto inverse_lane_id = group_size - threadIdx.x - 1;
-            unsigned int previous_group_first_element = 0;
+            const auto thread_id = threadIdx.x;
+            const auto inverse_lane_id = WARP_SIZE - thread_id - 1;
 
-            for (int warp_id = BINS / group_size - 1; warp_id >= 0; warp_id--)
+            int previous_group_first_element = 0;
+            for (int iter = BINS / WARP_SIZE - 1; iter >= 0; iter--)
             {
-                auto idx = warp_id * group_size + threadIdx.x;
+                const index_type idx = iter * WARP_SIZE + thread_id;
                 auto value = bins[idx];
 
-                for (int i = 1; i < group_size; i *= 2)
+                for (int i = 1; i < WARP_SIZE; i *= 2)
                 {
-                    int n = __shfl_down_sync(0xFFFFFFFF, value, i);
+                    auto n = __shfl_down_sync(0xFFFFFFFF, value, i);
                     if (inverse_lane_id >= i)
                         value += n;
                 }
@@ -281,13 +295,13 @@ namespace raw {
         }
 
         if (threadIdx.x == 0)
-            count[b * num_classes + c] = 0;
+            count[count_offset] = 0;
 
         __syncthreads();
 
-        for (auto i : block_stride_range(num_priors))
+        for (auto i : block_stride_range<BLOCK_SIZE>(num_priors))
         {
-            const float confidence = load_ldg(scores[(b * num_classes + c) * num_priors + i]);
+            const float confidence = load_ldg(scores[scores_offset + i]);
             if (confidence > threshold)
             {
                 using device::fast_divide;
@@ -332,10 +346,47 @@ namespace raw {
                 const index_type idx = atomicAdd(&bins[bin_index], 1);
                 if (idx < classwise_topK)
                 {
-                    indices[(b * num_classes + c) * classwise_topK + idx] = i;
-                    atomicAdd(&count[b * num_classes + c], 1);
+                    indices[indices_offset + idx] = i;
+                    atomicAdd(&count[count_offset], 1);
                 }
             }
+        }
+    }
+
+    template <class T>
+    __global__ void box_collect(Span<T> collected_bboxes, View<T> decoded_bboxes, View<int> indices, View<int> count, bool share_location, size_type num_priors, size_type num_classes, size_type classwise_topK, index_type background_label_id)
+    {
+        const index_type b = blockIdx.x / num_classes;
+        const index_type c = blockIdx.x % num_classes;
+        if (c == background_label_id)
+            return;
+
+        // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
+        // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
+        // indices: [batch_size, num_classes, classwise_topK]
+        // count: [batch_size, num_classes]
+        const auto count_offset = b * num_classes + c;
+        const auto indices_offset = (b * num_classes + c) * classwise_topK;
+        const auto collected_bboxes_offset_v4 = (b * num_classes + c) * classwise_topK;
+
+        const auto boxes = count[count_offset];
+        if (boxes == 0)
+            return;
+
+        using vector_type = get_vector_type_t<T, 4>;
+        auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
+        auto collected_bboxes_vPtr = vector_type::get_pointer(collected_bboxes.data());
+
+        for (auto i : block_stride_range<>(boxes))
+        {
+            const auto prior_id = indices[indices_offset + i];
+            const index_type idx = share_location ?
+                         b * num_priors + prior_id :
+                        (b * num_priors + prior_id) * num_classes + c;
+
+            vector_type box;
+            v_load(box, decoded_bboxes_vPtr[idx]);
+            v_store(collected_bboxes_vPtr[collected_bboxes_offset_v4 + i], box);
         }
     }
 
@@ -350,38 +401,52 @@ namespace raw {
         return NORMALIZED_BBOX ? width * height : (width + 1) * (height + 1);
     }
 
-    template <class T, bool NORMALIZED_BBOX>
-    __global__ void blockwise_class_nms(Span<int> indices, Span<int> count, View<T> decoded_bboxes, bool share_location, size_type num_priors, size_type num_classes, size_type classwise_topK, index_type background_label_id, float nms_threshold)
+    template <class T, bool NORMALIZED_BBOX, int NUM_BOXES>
+    __global__ void blockwise_class_nms_shared(Span<int> indices, Span<int> count, View<T> collected_bboxes, size_type num_classes, size_type classwise_topK, index_type background_label_id, float nms_threshold)
     {
         // indices: [batch_size, num_classes, classwise_topK]
         // count: [batch_size, num_classes]
-        // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
+        // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
 
-        auto b = blockIdx.x / num_classes;
-        auto c = blockIdx.x % num_classes;
+        const index_type b = blockIdx.x / num_classes;
+        const index_type c = blockIdx.x % num_classes;
         if (c == background_label_id)
             return;
 
-        const auto boxes = count[b * num_classes + c];
+        const auto count_offset = b * num_classes + c;
+        const auto indices_offset = (b * num_classes + c) * classwise_topK;
+        const auto collected_bboxes_offset_v4 = (b * num_classes + c) * classwise_topK;
+
+        const auto boxes = count[count_offset];
         if (boxes == 0)
             return;
 
         using vector_type = get_vector_type_t<T, 4>;
-        auto decoded_bboxes_vPtr = vector_type::get_pointer(decoded_bboxes.data());
+        auto collected_bboxes_vPtr = vector_type::get_pointer(collected_bboxes.data());
+
+        __shared__ vector_type boxes_shared[NUM_BOXES];
+        __shared__ int mask[NUM_BOXES];
+
+        for (auto i : block_stride_range<>(boxes))
+        {
+            mask[i] = 1;
+
+            vector_type box;
+            v_load(box, collected_bboxes_vPtr[collected_bboxes_offset_v4 + i]);
+            v_store(boxes_shared[i], box);
+        }
+
+        __syncthreads();
 
         for (int i = 0; i < boxes; i++)
         {
-            auto prior_id = indices[(b * num_classes + c) * classwise_topK + i];
-            if (prior_id != -1)
+            auto active = mask[i];
+            if (active)
             {
                 BoundingBox bbox1;
                 {
-                    const index_type idx = share_location ?
-                         b * num_priors + prior_id :
-                        (b * num_priors + prior_id) * num_classes + c;
-
                     vector_type box;
-                    v_load(box, decoded_bboxes_vPtr[idx]);
+                    v_load(box, boxes_shared[i]);
 
                     bbox1.xmin = box.data[0];
                     bbox1.ymin = box.data[1];
@@ -389,20 +454,15 @@ namespace raw {
                     bbox1.ymax = box.data[3];
                 }
 
-                for (auto j : block_stride_range(i + 1, boxes))
+                for (auto j : block_stride_range<>(i + 1, boxes))
                 {
-                    prior_id = load_ldg(indices[(b * num_classes + c) * classwise_topK + j]);
-                    if (prior_id == -1)
+                    if(!mask[j])
                         continue;
 
                     BoundingBox bbox2;
                     {
-                        const index_type idx = share_location ?
-                             b * num_priors + prior_id :
-                            (b * num_priors + prior_id) * num_classes + c;
-
                         vector_type box;
-                        v_load_ldg(box, decoded_bboxes_vPtr[idx]);
+                        v_load(box, boxes_shared[j]);
 
                         bbox2.xmin = box.data[0];
                         bbox2.ymin = box.data[1];
@@ -425,7 +485,7 @@ namespace raw {
 
                     float overlap = intersect_size / (bbox1_size + bbox2_size - intersect_size);
                     if (overlap > nms_threshold)
-                        indices[(b * num_classes + c) * classwise_topK + j] = -1;
+                        mask[j] = 0;
                 }
             }
 
@@ -433,22 +493,115 @@ namespace raw {
         }
 
         if (threadIdx.x == 0)
-            count[b * num_classes + c] = 0;
+            count[count_offset] = 0;
 
         __syncthreads();
 
-        for (auto i : block_stride_range(boxes))
+        for (auto i : block_stride_range<>(boxes))
         {
-            auto prior_id = indices[(b * num_classes + c) * classwise_topK + i];
-            if(prior_id != -1)
+            if(mask[i])
             {
-                const index_type idx = atomicAdd(&count[b * num_classes + c], 1);
-                indices[(b * num_classes + c) * classwise_topK + idx] = prior_id;
+                const index_type idx = atomicAdd(&count[count_offset], 1);
+                indices[indices_offset + idx] = indices[indices_offset + i];
             }
         }
     }
 
-    template <class T, std::size_t BINS>
+    template <class T, bool NORMALIZED_BBOX>
+    __global__ void blockwise_class_nms(Span<int> indices, Span<int> count, View<T> collected_bboxes, size_type num_classes, size_type classwise_topK, index_type background_label_id, float nms_threshold)
+    {
+        // indices: [batch_size, num_classes, classwise_topK]
+        // count: [batch_size, num_classes]
+        // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
+
+        const index_type b = blockIdx.x / num_classes;
+        const index_type c = blockIdx.x % num_classes;
+        if (c == background_label_id)
+            return;
+
+        const auto count_offset = b * num_classes + c;
+        const auto indices_offset = (b * num_classes + c) * classwise_topK;
+        const auto collected_bboxes_offset_v4 = (b * num_classes + c) * classwise_topK;
+
+        const auto boxes = count[count_offset];
+        if (boxes == 0)
+            return;
+
+        using vector_type = get_vector_type_t<T, 4>;
+        auto collected_bboxes_vPtr = vector_type::get_pointer(collected_bboxes.data());
+
+        for (int i = 0; i < boxes; i++)
+        {
+            auto prior_id = indices[indices_offset + i];
+            if (prior_id != -1)
+            {
+                BoundingBox bbox1;
+                {
+                    vector_type box;
+                    v_load(box, collected_bboxes_vPtr[collected_bboxes_offset_v4 + i]);
+
+                    bbox1.xmin = box.data[0];
+                    bbox1.ymin = box.data[1];
+                    bbox1.xmax = box.data[2];
+                    bbox1.ymax = box.data[3];
+                }
+
+                for (auto j : block_stride_range<>(i + 1, boxes))
+                {
+                    prior_id = indices[indices_offset + j];
+                    if (prior_id == -1)
+                        continue;
+
+                    BoundingBox bbox2;
+                    {
+                        vector_type box;
+                        v_load_ldg(box, collected_bboxes_vPtr[collected_bboxes_offset_v4 + j]);
+
+                        bbox2.xmin = box.data[0];
+                        bbox2.ymin = box.data[1];
+                        bbox2.xmax = box.data[2];
+                        bbox2.ymax = box.data[3];
+                    }
+
+                    using device::min;
+                    using device::max;
+
+                    BoundingBox intersect_bbox;
+                    intersect_bbox.xmin = max(bbox1.xmin, bbox2.xmin);
+                    intersect_bbox.ymin = max(bbox1.ymin, bbox2.ymin);
+                    intersect_bbox.xmax = min(bbox1.xmax, bbox2.xmax);
+                    intersect_bbox.ymax = min(bbox1.ymax, bbox2.ymax);
+
+                    float intersect_size = compute_size<NORMALIZED_BBOX>(intersect_bbox);
+                    float bbox1_size = compute_size<NORMALIZED_BBOX>(bbox1);
+                    float bbox2_size = compute_size<NORMALIZED_BBOX>(bbox2);
+
+                    float overlap = intersect_size / (bbox1_size + bbox2_size - intersect_size);
+                    if (overlap > nms_threshold)
+                        indices[indices_offset + j] = -1;
+                }
+            }
+
+            __syncthreads();
+        }
+
+        if (threadIdx.x == 0)
+            count[count_offset] = 0;
+
+        __syncthreads();
+
+        for (auto i : block_stride_range<>(boxes))
+        {
+            auto prior_id = indices[indices_offset + i];
+            if(prior_id != -1)
+            {
+                const index_type idx = atomicAdd(&count[count_offset], 1);
+                indices[indices_offset + idx] = prior_id;
+            }
+        }
+    }
+
+    template <class T, std::size_t BINS, int BLOCK_SIZE>
     __global__ void nms_collect(
         Span<int> kept_indices, Span<int> kept_count, View<int> indices, View<int> count, View<T> scores, float threshold,
         size_type num_classes, size_type num_priors, size_type classwise_topK, size_type keepTopK, index_type background_label_id)
@@ -462,8 +615,11 @@ namespace raw {
 
         const auto b = blockIdx.x;
 
+        // Refer to findTopK kernel to learn how sorting works
         __shared__ unsigned int bins[BINS];
-        for (auto i : block_stride_range(BINS))
+
+        #pragma unroll (BINS / BLOCK_SIZE)
+        for (auto i : block_stride_range<BLOCK_SIZE>(BINS))
             bins[i] = 0;
 
         __syncthreads();
@@ -473,11 +629,14 @@ namespace raw {
             if (c == background_label_id)
                 continue;
 
+            const auto indices_offset = (b * num_classes + c) * classwise_topK;
+            const auto scores_offset = (b * num_classes + c) * num_priors;
+
             auto boxes = count[b * num_classes + c];
-            for (auto i : block_stride_range(boxes))
+            for (auto i : block_stride_range<BLOCK_SIZE>(boxes))
             {
-                auto prior_id = indices[(b * num_classes + c) * classwise_topK + i];
-                const float confidence = load_ldg(scores[(b * num_classes + c) * num_priors + prior_id]);
+                auto prior_id = indices[indices_offset + i];
+                const float confidence = load_ldg(scores[scores_offset + prior_id]);
                 if (confidence > threshold)
                 {
                     using device::fast_divide;
@@ -494,35 +653,37 @@ namespace raw {
 
         __syncthreads();
 
+        #pragma unroll (BINS / BLOCK_SIZE)
+        for (auto i : block_stride_range<BLOCK_SIZE>(BINS))
+        {
+            int temp = (i == BINS - 1) ? 0 : bins[i + 1];
+
+            static_assert(BINS % BLOCK_SIZE == 0); /* cannot have divergence while using __syncthreads */
+            __syncthreads();
+
+            bins[i] = temp;
+            // bins[i] won't be read again => no need for __syncthreads here
+        }
+
         if (threadIdx.x < warpSize)
         {
-            for (int i = threadIdx.x; i < BINS - 1; i += warpSize)
+            constexpr int WARP_SIZE = 32; /* must be equal to warpSize */
+            // FORWARD_COMPATIBILITY_TAG: WARP_SIZE_DEPENDENT_CODE
+
+            static_assert(BINS % WARP_SIZE == 0, "number of bins must be a multiple of warpSize");
+
+            const auto thread_id = threadIdx.x;
+            const auto inverse_lane_id = WARP_SIZE - thread_id - 1;
+
+            int previous_group_first_element = 0;
+            for (int iter = BINS / WARP_SIZE - 1; iter >= 0; iter--)
             {
-                auto temp = bins[i + 1];
-                __syncwarp();
-                bins[i] = temp;
-                // bins[i] won't be read again => no need for __syncwarp here
-            }
-
-            if (threadIdx.x == 0)
-                bins[BINS - 1] = 0;
-
-            constexpr int group_size = 32; /* must be equal to warpSize */
-            assert(group_size == warpSize);
-
-            static_assert(BINS % group_size == 0, "number of bins must be a multiple of warpSize");
-
-            const auto inverse_lane_id = group_size - threadIdx.x - 1;
-            unsigned int previous_group_first_element = 0;
-
-            for (int warp_id = BINS / group_size - 1; warp_id >= 0; warp_id--)
-            {
-                auto idx = warp_id * group_size + threadIdx.x;
+                const index_type idx = iter * WARP_SIZE + thread_id;
                 auto value = bins[idx];
 
-                for (int i = 1; i < group_size; i *= 2)
+                for (int i = 1; i < WARP_SIZE; i *= 2)
                 {
-                    int n = __shfl_down_sync(0xFFFFFFFF, value, i);
+                    auto n = __shfl_down_sync(0xFFFFFFFF, value, i);
                     if (inverse_lane_id >= i)
                         value += n;
                 }
@@ -544,11 +705,14 @@ namespace raw {
             if (c == background_label_id)
                 continue;
 
+            const auto indices_offset = (b * num_classes + c) * classwise_topK;
+            const auto scores_offset = (b * num_classes + c) * num_priors;
+
             auto boxes = count[b * num_classes + c];
-            for (auto i : block_stride_range(boxes))
+            for (auto i : block_stride_range<BLOCK_SIZE>(boxes))
             {
-                auto prior_id = indices[b * num_classes * classwise_topK + c * classwise_topK + i];
-                const float confidence = load_ldg(scores[b * (num_classes * num_priors) + c * num_priors + prior_id]);
+                auto prior_id = indices[indices_offset + i];
+                const float confidence = load_ldg(scores[scores_offset + prior_id]);
                 if (confidence > threshold)
                 {
                     using device::fast_divide;
@@ -686,13 +850,13 @@ void findTopK(const Stream& stream, TensorSpan<int> indices, TensorSpan<int> cou
 
     /* each block processes one class from each batch */
     auto num_blocks = batch_size * num_classes;
-    auto num_threads = std::max<std::size_t>(std::min<std::size_t>(1024, num_priors), 32);
+    constexpr auto BLOCK_SIZE = 256;
 
     dim3 grid_size(num_blocks);
-    dim3 block_size(num_threads);
+    dim3 block_size(BLOCK_SIZE);
     auto policy = execution_policy(grid_size, block_size, stream);
 
-    auto kernel = raw::findTopK<T, 2048>;
+    auto kernel = raw::findTopK<T, 2048, BLOCK_SIZE>;
     launch_kernel(kernel, policy, indices, count, scores, threshold, classwise_topK, num_classes, num_priors, background_label_id);
 }
 
@@ -700,24 +864,62 @@ template void findTopK(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorVi
 template void findTopK(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<float>, std::size_t, float);
 
 template <class T>
-void blockwise_class_nms(const Stream& stream, TensorSpan<int> indices, TensorSpan<int> count, TensorView<T> decoded_bboxes,
-    bool share_location, bool normalized_bbox, std::size_t background_label_id, float nms_threshold)
+void box_collect(const Stream& stream, TensorSpan<T> collected_bboxes, TensorView<T> decoded_bboxes, TensorView<int> indices, TensorView<int> count, bool share_location, std::size_t background_label_id)
 {
+    // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
+    // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
     // indices: [batch_size, num_classes, classwise_topK]
     // count: [batch_size, num_classes]
-    // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
 
-    const auto batch_size = indices.get_axis_size(0);
-    CV_Assert(count.get_axis_size(0) == batch_size);
+    const auto batch_size = collected_bboxes.get_axis_size(0);
     CV_Assert(decoded_bboxes.get_axis_size(0) == batch_size);
+    CV_Assert(indices.get_axis_size(0) == batch_size);
+    CV_Assert(count.get_axis_size(0) == batch_size);
 
-    const auto num_classes = indices.get_axis_size(1);
+    const auto num_classes = collected_bboxes.get_axis_size(1);
+    CV_Assert(indices.get_axis_size(1) == num_classes);
     CV_Assert(count.get_axis_size(1) == num_classes);
 
-    const auto classwise_topK = indices.get_axis_size(2);
+    const auto classwise_topK = collected_bboxes.get_axis_size(2);
+    CV_Assert(indices.get_axis_size(2) == classwise_topK);
+
     const auto num_priors = decoded_bboxes.get_axis_size(1);
 
     CV_Assert(!share_location || decoded_bboxes.get_axis_size(2) == 1);
+
+    /* each block processes one class from each batch */
+    auto num_blocks = batch_size * num_classes;
+    auto num_threads = 256;
+
+    dim3 grid_size(num_blocks);
+    dim3 block_size(num_threads);
+    auto policy = execution_policy(grid_size, block_size, stream);
+
+    auto kernel = raw::box_collect<T>;
+    launch_kernel(kernel, policy, collected_bboxes, decoded_bboxes, indices, count, share_location, num_priors, num_classes, classwise_topK, background_label_id);
+}
+
+template void box_collect(const Stream&, TensorSpan<float>, TensorView<float>, TensorView<int>, TensorView<int>, bool, std::size_t);
+template void box_collect(const Stream&, TensorSpan<__half>, TensorView<__half>, TensorView<int>, TensorView<int>, bool, std::size_t);
+
+template <class T>
+void blockwise_class_nms(const Stream& stream, TensorSpan<int> indices, TensorSpan<int> count, TensorView<T> collected_bboxes,
+    bool normalized_bbox, std::size_t background_label_id, float nms_threshold)
+{
+    // indices: [batch_size, num_classes, classwise_topK]
+    // count: [batch_size, num_classes]
+    // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
+
+    const auto batch_size = indices.get_axis_size(0);
+    CV_Assert(count.get_axis_size(0) == batch_size);
+    CV_Assert(collected_bboxes.get_axis_size(0) == batch_size);
+
+    const auto num_classes = indices.get_axis_size(1);
+    CV_Assert(count.get_axis_size(1) == num_classes);
+    CV_Assert(collected_bboxes.get_axis_size(1) == num_classes);
+
+    const auto classwise_topK = indices.get_axis_size(2);
+    CV_Assert(collected_bboxes.get_axis_size(2) == classwise_topK);
 
     /* each block processes one class from each batch */
     auto num_blocks = batch_size * num_classes;
@@ -727,20 +929,37 @@ void blockwise_class_nms(const Stream& stream, TensorSpan<int> indices, TensorSp
     dim3 block_size(num_threads);
     auto policy = execution_policy(grid_size, block_size, stream);
 
-    if (normalized_bbox)
+    constexpr int NUM_BOXES = 128;
+    if (classwise_topK <= NUM_BOXES)
     {
-        auto kernel = raw::blockwise_class_nms<T, true>;
-        launch_kernel(kernel, policy, indices, count, decoded_bboxes, share_location, num_priors, num_classes, classwise_topK, background_label_id, nms_threshold);
+        if (normalized_bbox)
+        {
+            auto kernel = raw::blockwise_class_nms_shared<T, true, NUM_BOXES>;
+            launch_kernel(kernel, policy, indices, count, collected_bboxes, num_classes, classwise_topK, background_label_id, nms_threshold);
+        }
+        else
+        {
+            auto kernel = raw::blockwise_class_nms_shared<T, false, NUM_BOXES>;
+            launch_kernel(kernel, policy, indices, count, collected_bboxes, num_classes, classwise_topK, background_label_id, nms_threshold);
+        }
     }
     else
     {
-        auto kernel = raw::blockwise_class_nms<T, false>;
-        launch_kernel(kernel, policy, indices, count, decoded_bboxes, share_location, num_priors, num_classes, classwise_topK, background_label_id, nms_threshold);
+        if (normalized_bbox)
+        {
+            auto kernel = raw::blockwise_class_nms<T, true>;
+            launch_kernel(kernel, policy, indices, count, collected_bboxes, num_classes, classwise_topK, background_label_id, nms_threshold);
+        }
+        else
+        {
+            auto kernel = raw::blockwise_class_nms<T, false>;
+            launch_kernel(kernel, policy, indices, count, collected_bboxes, num_classes, classwise_topK, background_label_id, nms_threshold);
+        }
     }
 }
 
-template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<__half>, bool, bool, std::size_t, float);
-template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<float>, bool, bool, std::size_t, float);
+template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<__half>, bool, std::size_t, float);
+template void blockwise_class_nms(const Stream&, TensorSpan<int>, TensorSpan<int>, TensorView<float>, bool, std::size_t, float);
 
 template <class T>
 void nms_collect(const Stream& stream, TensorSpan<int> kept_indices, TensorSpan<int> kept_count,
@@ -769,13 +988,13 @@ void nms_collect(const Stream& stream, TensorSpan<int> kept_indices, TensorSpan<
     auto num_priors = scores.get_axis_size(2);
 
     auto num_blocks = batch_size;
-    auto num_threads = 1024; // TODO
+    constexpr int BLOCK_SIZE = 1024;
 
     dim3 grid_size(num_blocks);
-    dim3 block_size(num_threads);
+    dim3 block_size(BLOCK_SIZE);
     auto policy = execution_policy(grid_size, block_size, stream);
 
-    auto kernel = raw::nms_collect<T, 512>;
+    auto kernel = raw::nms_collect<T, 1024, BLOCK_SIZE>;
     launch_kernel(kernel, policy, kept_indices, kept_count, indices, count, scores, threshold, num_classes, num_priors, classwise_topK, keepTopK, background_label_id);
 }
 

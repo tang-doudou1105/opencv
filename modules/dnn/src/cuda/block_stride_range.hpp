@@ -12,7 +12,7 @@
 
 namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace device {
 
-template <int dim, class index_type = device::index_type, class size_type = device::size_type>
+template <int dim, int BLOCK_SIZE = 0, class index_type = device::index_type, class size_type = device::size_type>
 class block_stride_range_generic {
 public:
     __device__ block_stride_range_generic(index_type to_) : from(0), to(to_) { }
@@ -29,7 +29,8 @@ public:
         __device__ index_type operator*() const { return pos; }
 
         __device__ iterator& operator++() {
-            pos += static_cast<index_type>(getBlockDim<dim>());
+            const index_type block_size = BLOCK_SIZE == 0 ? getBlockDim<dim>() : BLOCK_SIZE;
+            pos += block_size;
             return *this;
         }
 
@@ -61,7 +62,9 @@ private:
 using block_stride_range_x = block_stride_range_generic<0>;
 using block_stride_range_y = block_stride_range_generic<1>;
 using block_stride_range_z = block_stride_range_generic<2>;
-using block_stride_range = block_stride_range_x;
+
+template <size_type BLOCK_SIZE = 0>
+using block_stride_range = block_stride_range_generic<0, BLOCK_SIZE>;
 
 }}}}} /* namespace cv::dnn::cuda4dnn::csl::device */
 

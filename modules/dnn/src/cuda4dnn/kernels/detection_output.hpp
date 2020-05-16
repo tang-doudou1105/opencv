@@ -22,8 +22,11 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace kernels {
     void findTopK(const csl::Stream& stream, csl::TensorSpan<int> indices, csl::TensorSpan<int> count, csl::TensorView<T> scores, std::size_t background_label_id, float threshold);
 
     template <class T>
-    void blockwise_class_nms(const csl::Stream& stream, csl::TensorSpan<int> indices, csl::TensorSpan<int> count, csl::TensorView<T> decoded_bboxes,
-        bool share_location, bool normalized_bbox, std::size_t background_label_id, float nms_threshold);
+    void box_collect(const csl::Stream& stream, csl::TensorSpan<T> collected_bboxes, csl::TensorView<T> decoded_bboxes, csl::TensorView<int> indices, csl::TensorView<int> count, bool share_location, std::size_t background_label_id);
+
+    template <class T>
+    void blockwise_class_nms(const csl::Stream& stream, csl::TensorSpan<int> indices, csl::TensorSpan<int> count, csl::TensorView<T> collected_bboxes,
+            bool normalized_bbox, std::size_t background_label_id, float nms_threshold);
 
     template <class T>
     void nms_collect(const csl::Stream& stream, csl::TensorSpan<int> kept_indices, csl::TensorSpan<int> kept_count,
