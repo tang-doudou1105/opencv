@@ -46,6 +46,10 @@
 #include "op_vkcom.hpp"
 #include "op_cuda.hpp"
 
+#ifdef HAVE_CUDA
+#include "cuda4dnn/csl/event.hpp"
+#endif
+
 #include "halide_scheduler.hpp"
 
 #include <set>
@@ -1209,6 +1213,9 @@ struct Net::Impl
         CudaInfo_t(cuda4dnn::csl::CSLContext ctxt) : context(std::move(ctxt)) { }
         cuda4dnn::csl::CSLContext context;
         cuda4dnn::csl::Workspace workspace;
+
+        std::vector<cuda4dnn::csl::Event> layerTimingsStart;
+        std::vector<cuda4dnn::csl::Event> layerTimingsEnd;
     };
 
     std::unique_ptr<CudaInfo_t> cudaInfo;
@@ -2346,6 +2353,9 @@ struct Net::Impl
         CV_Assert(haveCUDA());
 
 #ifdef HAVE_CUDA
+        cudaInfo->layerTimingsStart.resize(layers.size());
+        cudaInfo->layerTimingsEnd.resize(layers.size());
+
         for (auto& layer : layers)
         {
             auto& ld = layer.second;
@@ -2367,6 +2377,9 @@ struct Net::Impl
 
             auto cudaNode = node.dynamicCast<CUDABackendNode>();
             cudaInfo->workspace.require(cudaNode->get_workspace_memory_in_bytes());
+
+            cudaInfo->layerTimingsStart[ld.id]  = cuda4dnn::csl::Event(true, true);
+            cudaInfo->layerTimingsEnd[ld.id] = cuda4dnn::csl::Event(true, true);
         }
 #endif
     }
@@ -3121,7 +3134,9 @@ struct Net::Impl
                     Ptr<CUDABackendNode> cudaNode = node.dynamicCast<CUDABackendNode>();
                     CV_Assert(!cudaNode.empty());
 
+                    cudaInfo->layerTimingsStart[ld.id].record(cudaInfo->context.stream);
                     cudaNode->forward(ld.inputBlobsWrappers, ld.outputBlobsWrappers, cudaInfo->workspace);
+                    cudaInfo->layerTimingsEnd[ld.id].record(cudaInfo->context.stream);
 #endif
                 }
                 else if (preferableBackend == DNN_BACKEND_HALIDE)
@@ -4655,7 +4670,40 @@ void Net::setHalideScheduler(const String& scheduler)
 
 int64 Net::getPerfProfile(std::vector<double>& timings)
 {
-    timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+#ifdef HAVE_CUDA
+    if (impl->preferableBackend == DNN_BACKEND_CUDA)
+    {
+        timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+        for (auto& layer : impl->layers)
+        {
+            auto& ld = layer.second;
+            if (ld.id == 0)
+                continue;
+
+            if (ld.skip || !ld.flag)
+            {
+                timings[ld.id - 1] = 0;
+                continue;
+            }
+
+            if (ld.backendNodes.count(DNN_BACKEND_CUDA))
+            {
+                auto& start = impl->cudaInfo->layerTimingsStart[ld.id];
+                auto& end = impl->cudaInfo->layerTimingsEnd[ld.id];
+                auto time = cuda4dnn::csl::TimeElapsedBetweenEvents(start, end) / 1000 * getTickFrequency();
+                timings[ld.id - 1] = time;
+            }
+            else
+            {
+                timings[ld.id - 1] = impl->layersTimings[ld.id];
+            }
+        }
+    }
+    else
+#endif
+    {
+        timings = std::vector<double>(impl->layersTimings.begin() + 1, impl->layersTimings.end());
+    }
     int64 total = (int64)std::accumulate(timings.begin(), timings.end(), 0.0);
     return total;
 }
