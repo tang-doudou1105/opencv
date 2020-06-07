@@ -965,7 +965,7 @@ public:
         config.share_location = _shareLocation;
         config.num_priors = priors_shape[2] / 4;
         config.num_classes = _numClasses;
-        config.background_label_id = _backgroundLabelId;
+        config.background_class_id = _backgroundLabelId;
 
         config.transpose_location = _locPredTransposed;
         config.variance_encoded_in_target = _varianceEncodedInTarget;

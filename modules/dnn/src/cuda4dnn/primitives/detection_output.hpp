@@ -13,6 +13,7 @@
 #include "../kernels/fill_copy.hpp"
 #include "../kernels/permute.hpp"
 #include "../kernels/detection_output.hpp"
+#include "../kernels/grid_nms.hpp"
 
 #include <cstddef>
 #include <utility>
@@ -31,7 +32,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         bool share_location;
         std::size_t num_priors;
         std::size_t num_classes;
-        std::size_t background_label_id;
+        std::size_t background_class_id;
 
         bool transpose_location;
         bool variance_encoded_in_target;
@@ -47,6 +48,22 @@ namespace cv { namespace dnn { namespace cuda4dnn {
 
     template <class T>
     class DetectionOutputOp final : public CUDABackendNode {
+    private:
+        /* We have block level NMS kernel where each block handles one class of one batch item.
+         * If the number of classes and batch size together is very low, the blockwise NMS
+         * kernel won't sturate the GPU.
+         *
+         * We also have a grid level NMS kernel where multiple blocks handle each class of every batch item.
+         * This performs better in the worst case and utilizes resources better when block level kernel isn't
+         * able to saturate the GPU with enough work. However, this is not efficient in the average case where
+         * the block level kernel is able to saturate the GPU. It does better when the blockwise NMS barely
+         * saturates the GPU.
+         *
+         * `GRID_NMS_CUTOFF` is the cutoff for `num_classes * batch_size` above which we will switch from grid
+         * level NMS to block level NMS.
+         */
+        static constexpr int GRID_NMS_CUTOFF = 32;
+
     public:
         using wrapper_type = GetCUDABackendWrapperType<T>;
 
@@ -58,7 +75,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             share_location = config.share_location;
             num_priors = config.num_priors;
             num_classes = config.num_classes;
-            background_label_id = config.background_label_id;
+            background_class_id = config.background_class_id;
 
             transpose_location = config.transpose_location;
             variance_encoded_in_target = config.variance_encoded_in_target;
@@ -79,16 +96,24 @@ namespace cv { namespace dnn { namespace cuda4dnn {
                     classwise_topK = keepTopK;
             }
 
+            auto batch_size = config.batch_size;
             auto num_loc_classes = (share_location ? 1 : num_classes);
 
             csl::WorkspaceBuilder builder;
-            builder.require<T>(config.batch_size * num_priors * num_loc_classes * 4); /* decoded boxes */
-            builder.require<T>(config.batch_size * num_priors * num_classes); /* transposed scores */
-            builder.require<int>(config.batch_size * num_classes * classwise_topK); /* indices */
-            builder.require<int>(config.batch_size * num_classes); /* classwise topK count */
-            builder.require<T>(config.batch_size * num_classes * classwise_topK * 4); /* topK decoded boxes */
-            builder.require<int>(config.batch_size * keepTopK); /* final kept indices */
-            builder.require<int>(config.batch_size); /* kept indices count */
+            builder.require<T>(batch_size * num_priors * num_loc_classes * 4); /* decoded boxes */
+            builder.require<T>(batch_size * num_classes * num_priors); /* transposed scores */
+            builder.require<int>(batch_size * num_classes * classwise_topK); /* indices */
+            builder.require<int>(batch_size * num_classes); /* classwise topK count */
+            builder.require<T>(batch_size * num_classes * classwise_topK * 4); /* topK decoded boxes */
+
+            if (batch_size * num_classes <= GRID_NMS_CUTOFF)
+            {
+                auto workspace_per_batch_item = kernels::getGridNMSWorkspaceSizePerBatchItem(num_classes, classwise_topK);
+                builder.require(batch_size * workspace_per_batch_item);
+            }
+
+            builder.require<int>(batch_size * keepTopK); /* final kept indices */
+            builder.require<int>(batch_size); /* kept indices count */
             builder.require<int>(1); /* total number of detections */
 
             scratch_mem_in_bytes = builder.required_workspace_size();
@@ -161,7 +186,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             }
 
             kernels::decode_bboxes<T>(stream, decoded_boxes, locations, priors,
-                num_loc_classes, share_location, background_label_id,
+                num_loc_classes, share_location, background_class_id,
                 transpose_location, variance_encoded_in_target,
                 corner_true_or_center_false, normalized_bbox,
                 clip_box, clip_width, clip_height);
@@ -189,7 +214,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
                 count = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
             }
 
-            kernels::findTopK<T>(stream, indices, count, scores_permuted, background_label_id, confidence_threshold);
+            kernels::findTopK<T>(stream, indices, count, scores_permuted, background_class_id, confidence_threshold);
 
             // collected_bboxes: [batch_size, num_classes, classwise_topK, 4]
             csl::TensorSpan<T> collected_bboxes;
@@ -197,9 +222,19 @@ namespace cv { namespace dnn { namespace cuda4dnn {
                 auto shape = std::vector<std::size_t>{batch_size, num_classes, classwise_topK, 4};
                 collected_bboxes = allocator.get_tensor_span<T>(std::begin(shape), std::end(shape));
             }
-            kernels::box_collect<T>(stream, collected_bboxes, decoded_boxes, indices, count, share_location, background_label_id);
 
-            kernels::blockwise_class_nms<T>(stream, indices, count, collected_bboxes, normalized_bbox, background_label_id, nms_threshold);
+            kernels::box_collect<T>(stream, collected_bboxes, decoded_boxes, indices, count, share_location, background_class_id);
+
+            if (batch_size * num_classes <= GRID_NMS_CUTOFF)
+            {
+                auto workspace_per_batch_item = kernels::getGridNMSWorkspaceSizePerBatchItem(num_classes, classwise_topK);
+                auto workspace = allocator.get_span<unsigned int>(batch_size * workspace_per_batch_item / sizeof(unsigned int));
+                kernels::grid_nms<T>(stream, workspace, indices, count, collected_bboxes, background_class_id, normalized_bbox, nms_threshold);
+            }
+            else
+            {
+                kernels::blockwise_class_nms<T>(stream, indices, count, collected_bboxes, normalized_bbox, background_class_id, nms_threshold);
+            }
 
             // kept_indices: [batch_size, keepTopK]
             csl::TensorSpan<int> kept_indices;
@@ -215,13 +250,11 @@ namespace cv { namespace dnn { namespace cuda4dnn {
                 kept_count = allocator.get_tensor_span<int>(std::begin(shape), std::end(shape));
             }
 
-            kernels::nms_collect<T>(stream, kept_indices, kept_count, indices, count, scores_permuted, confidence_threshold, background_label_id);
+            kernels::nms_collect<T>(stream, kept_indices, kept_count, indices, count, scores_permuted, confidence_threshold, background_class_id);
 
             auto num_detections = allocator.get_span<int>(1);
             kernels::fill<int>(stream, num_detections, 0);
-
             kernels::fill<T>(stream, output, 0.0);
-
             kernels::consolidate_detections<T>(stream, output, kept_indices, kept_count, decoded_boxes, scores_permuted, share_location, num_detections.data());
         }
 
@@ -234,7 +267,7 @@ namespace cv { namespace dnn { namespace cuda4dnn {
         bool share_location;
         std::size_t num_priors;
         std::size_t num_classes;
-        std::size_t background_label_id;
+        std::size_t background_class_id;
 
         bool transpose_location;
         bool variance_encoded_in_target;
