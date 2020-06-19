@@ -1244,7 +1244,7 @@ TEST_P(Test_TensorFlow_nets, EfficientDet)
     if (target == DNN_TARGET_CUDA_FP16)
     {
         scoreDiff = 0.002;
-        iouDiff = 0.003;
+        iouDiff = 0.004;
     }
     normAssertDetections(ref, out, "", 0.5, scoreDiff, iouDiff);
     expectNoFallbacksFromIE(net);
