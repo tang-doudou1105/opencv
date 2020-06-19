@@ -141,11 +141,6 @@ namespace cv { namespace dnn { namespace cuda4dnn {
             // priors: [1, 2, num_priors, 4]
             auto priors_wrapper = inputs[2].dynamicCast<wrapper_type>();
             auto priors = priors_wrapper->getView();
-            {
-                /* for some reason, the priors wrapper contains the wrong shape, i.e. [1, 1, num_priors * 4] */
-                auto shape = std::vector<std::size_t>{1, 2, num_priors, 4};
-                priors = csl::TensorView<T>(priors.get(), std::begin(shape), std::end(shape));
-            }
 
             // output: [1, 1, batch_size * keepTopK, 7]
             auto output_wrapper = outputs[0].dynamicCast<wrapper_type>();

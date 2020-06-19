@@ -35,8 +35,12 @@ namespace raw {
     {
         // decoded_bboxes: [batch_size, num_priors, num_loc_classes, 4]
         // locations: [batch_size, num_priors, num_loc_classes, 4]
-        // priors: [1, 2, num_priors, 4]
-        const size_type num_priors = priors.size() / 8; /* 4 bbox values + 4 variance values per prior */
+        // priors: [1, C, num_priors, 4]
+        // C = 2 if !VARIANCE_ENCODED_IN_TARGET; otherwise, 1
+
+        /* 4 bbox values + 4 variance values per prior */
+        constexpr int PRIOR_BOX_SIZE = VARIANCE_ENCODED_IN_TARGET ? 4 : 8;
+        const size_type num_priors = priors.size() / PRIOR_BOX_SIZE;
 
         using vector_type = get_vector_type_t<T, 4>;
         auto locations_vPtr = vector_type::get_pointer(locations.data());
