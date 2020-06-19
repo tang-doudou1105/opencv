@@ -316,17 +316,6 @@ namespace raw {
 
                 const int mask_offset = static_cast<unsigned>(i * topK_gs_by32) / ITEMS_PER_THREAD;
 
-                #pragma unroll 1
-                for (int r = 0; r < num_rows; r++)
-                {
-                    /* we assume that `mask` is aligned; we need just one prefetch for one element and
-                     * the entire cache line will be brought in (which preassumably covers the full vector)
-                     */
-                    auto idx = r * BLOCK_SIZE + thread_id;
-                    if (idx * 4 < num_32b_masks)
-                        __prefetch_global_l2(&mask_vPtr[mask_offset + idx]);
-                }
-
                 /* We fetch the index from the memory and store it in a register. We will not use it until
                  * much later. This helps avoid a long scoreboard stall.
                  */
