@@ -35,7 +35,14 @@ namespace raw {
             if (width < 0 || height < 0)
                 return 0.0;
 
-            return NORMALIZED_BBOX ? width * height : (width + 1) * (height + 1);
+            if (!NORMALIZED_BBOX)
+            {
+                width += 1;
+                height += 1;
+            }
+
+            using  device::mul_ftz;
+            return mul_ftz(width, height);
         };
 
         // topK_gs is topK rounded upwards to some size
@@ -163,68 +170,81 @@ namespace raw {
 
         auto mask_offset = threadIdx.x / 32;
 
-        #pragma unroll 32
-        for (int i = 0; i < BLOCK_SIZE; i++)
+        constexpr int UNROLL_SIZE = 4;
+
+        #pragma unroll 8
+        for (int s = 0; s < BLOCK_SIZE; s += UNROLL_SIZE)
         {
-            bool do_not_reject_j = false;
+            bool do_not_reject_j[UNROLL_SIZE];
 
-            /* The number of boxes need not necessarily be a multiple of BLOCK_SIZE.
-             * However, the shared memory allocated can hold BLOCK_SIZE boxes from
-             * each group. Accessing the uninitialized regions of shared memory is
-             * a valid memory operation as long as the memory has been allocated.
-             *
-             * The condition below is only required when one of the groups does not
-             * fully filled with valid boxes. This situations are relatively rare. It's
-             * more common to see both groups completely filled.
-             *
-             * We comment this condition to improve the performance of the common case.
-             * This leads to a net improvement.
-             */
-            // if (group_i_offset + i < boxes && group_j_offset + threadIdx.x < boxes)
+            #pragma unroll
+            for (int k = 0; k < UNROLL_SIZE; k++)
             {
-                BoundingBox bbox_i;
-                float bbox_i_size;
+                int i = s + k;
+
+                /* The number of boxes need not necessarily be a multiple of BLOCK_SIZE.
+                * However, the shared memory allocated can hold BLOCK_SIZE boxes from
+                * each group. Accessing the uninitialized regions of shared memory is
+                * a valid memory operation as long as the memory has been allocated.
+                *
+                * The condition below is only required when one of the groups does not
+                * fully filled with valid boxes. This situations are relatively rare. It's
+                * more common to see both groups completely filled.
+                *
+                * We comment this condition to improve the performance of the common case.
+                * This leads to a net improvement.
+                */
+                // if (group_i_offset + i < boxes && group_j_offset + threadIdx.x < boxes)
                 {
-                    vector_type box;
-                    v_load(box, group_i_boxes[i]);
-                    bbox_i.xmin = box.data[0];
-                    bbox_i.ymin = box.data[1];
-                    bbox_i.xmax = box.data[2];
-                    bbox_i.ymax = box.data[3];
+                    BoundingBox bbox_i;
+                    float bbox_i_size;
+                    {
+                        vector_type box;
+                        v_load(box, group_i_boxes[i]);
+                        bbox_i.xmin = box.data[0];
+                        bbox_i.ymin = box.data[1];
+                        bbox_i.xmax = box.data[2];
+                        bbox_i.ymax = box.data[3];
 
-                    bbox_i_size = group_i_size[i];
+                        bbox_i_size = group_i_size[i];
+                    }
+
+                    using device::min;
+                    using device::max;
+
+                    BoundingBox intersect_bbox;
+                    intersect_bbox.xmin = max(bbox_i.xmin, bbox_j.xmin);
+                    intersect_bbox.ymin = max(bbox_i.ymin, bbox_j.ymin);
+                    intersect_bbox.xmax = min(bbox_i.xmax, bbox_j.xmax);
+                    intersect_bbox.ymax = min(bbox_i.ymax, bbox_j.ymax);
+
+                    float intersect_size = compute_size(intersect_bbox);
+
+                    using device::fast_divide_ftz;
+                    float iou = fast_divide_ftz(intersect_size, bbox_i_size + bbox_j_size - intersect_size);
+                    do_not_reject_j[k] = iou <= nms_threshold;
                 }
-
-                using device::min;
-                using device::max;
-
-                BoundingBox intersect_bbox;
-                intersect_bbox.xmin = max(bbox_i.xmin, bbox_j.xmin);
-                intersect_bbox.ymin = max(bbox_i.ymin, bbox_j.ymin);
-                intersect_bbox.xmax = min(bbox_i.xmax, bbox_j.xmax);
-                intersect_bbox.ymax = min(bbox_i.ymax, bbox_j.ymax);
-
-                float intersect_size = compute_size(intersect_bbox);
-
-                using device::fast_divide;
-                float iou = fast_divide(intersect_size, bbox_i_size + bbox_j_size - intersect_size);
-                do_not_reject_j = iou <= nms_threshold;
             }
 
-            auto predicate = __ballot_sync(0xFFFFFFFF, do_not_reject_j);
-            if (threadIdx.x % 32 == 0)
-                mask_shared[mask_offset] = predicate;
+            #pragma unroll
+            for (int k = 0; k < UNROLL_SIZE; k++)
+            {
+                auto predicate = __ballot_sync(0xFFFFFFFF, do_not_reject_j[k]);
+                if (threadIdx.x % 32 == 0)
+                    mask_shared[mask_offset] = predicate;
 
-            /* The following operation should logically be inside the previous if branch. Note that `mask_offset`
-             * is only used by lane zero threads. Hence, there is no harm in executing it other threads as it is
-             * unused there.
-             *
-             * Keeping it inside prevents the compiler from treating it as a constexpr addition to the address in
-             * successive unrolled iterations. A register is used and instructions are emitted to multiply the
-             * addend by four to obtain the byte offset. Pulling it out of the branch makes the compiler do constexpr
-             * addition on the address in successive unrolled iterations.
-             */
-            mask_offset += BLOCK_SIZE / 32;
+                /* The following operation should logically be inside the previous if branch. Note that `mask_offset`
+                * is only used by lane zero threads. Hence, there is no harm in executing it other threads as it is
+                * unused there.
+
+                *
+                * Keeping it inside prevents the compiler from treating it as a constexpr addition to the address in
+                * successive unrolled iterations. A register is used and instructions are emitted to multiply the
+                * addend by four to obtain the byte offset. Pulling it out of the branch makes the compiler do constexpr
+                * addition on the address in successive unrolled iterations.
+                */
+                mask_offset += BLOCK_SIZE / 32;
+            }
         }
 
         __syncthreads();
