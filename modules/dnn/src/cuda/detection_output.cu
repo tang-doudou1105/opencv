@@ -209,8 +209,8 @@ namespace raw {
             const float confidence = load_ldg(scores[i]);
             if (confidence > threshold)
             {
-                using device::fast_divide;
-                auto conf_scaled = fast_divide(confidence - threshold, 1 - threshold);
+                using device::fast_divide_ftz;
+                auto conf_scaled = fast_divide_ftz(confidence - threshold, 1 - threshold);
 
                 using device::clamp;
                 int bin_index = conf_scaled * BINS;
@@ -310,8 +310,8 @@ namespace raw {
             const float confidence = load_ldg(scores[i]);
             if (confidence > threshold)
             {
-                using device::fast_divide;
-                auto conf_scaled = fast_divide(confidence - threshold, 1 - threshold);
+                using device::fast_divide_ftz;
+                auto conf_scaled = fast_divide_ftz(confidence - threshold, 1 - threshold);
 
                 int bin_index = conf_scaled * BINS;
                 bin_index = clamp<int>(bin_index, 0, BINS - 1);
@@ -490,8 +490,8 @@ namespace raw {
                     float bbox1_size = compute_size<NORMALIZED_BBOX>(bbox1);
                     float bbox2_size = compute_size<NORMALIZED_BBOX>(bbox2);
 
-                    using device::fast_divide;
-                    float iou = fast_divide(intersect_size, bbox1_size + bbox2_size - intersect_size);
+                    using device::fast_divide_ftz;
+                    float iou = fast_divide_ftz(intersect_size, bbox1_size + bbox2_size - intersect_size);
                     if (iou > nms_threshold)
                         mask[j] = 0;
                 }
@@ -584,8 +584,8 @@ namespace raw {
                     float bbox1_size = compute_size<NORMALIZED_BBOX>(bbox1);
                     float bbox2_size = compute_size<NORMALIZED_BBOX>(bbox2);
 
-                    using device::fast_divide;
-                    float iou = fast_divide(intersect_size, bbox1_size + bbox2_size - intersect_size);
+                    using device::fast_divide_ftz;
+                    float iou = fast_divide_ftz(intersect_size, bbox1_size + bbox2_size - intersect_size);
                     if (iou > nms_threshold)
                         indices[indices_offset + j] = -1;
                 }
@@ -651,8 +651,8 @@ namespace raw {
                 const float confidence = load_ldg(scores[scores_offset + prior_id]);
                 if (confidence > threshold)
                 {
-                    using device::fast_divide;
-                    auto conf_scaled = fast_divide(confidence - threshold, 1 - threshold);
+                    using device::fast_divide_ftz;
+                    auto conf_scaled = fast_divide_ftz(confidence - threshold, 1 - threshold);
 
                     using device::clamp;
                     int bin_index = conf_scaled * BINS;
@@ -716,8 +716,8 @@ namespace raw {
                 const float confidence = load_ldg(scores[scores_offset + prior_id]);
                 if (confidence > threshold)
                 {
-                    using device::fast_divide;
-                    auto conf_scaled = fast_divide(confidence - threshold, 1 - threshold);
+                    using device::fast_divide_ftz;
+                    auto conf_scaled = fast_divide_ftz(confidence - threshold, 1 - threshold);
 
                     using device::clamp;
                     int bin_index = conf_scaled * BINS;
