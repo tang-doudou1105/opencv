@@ -236,7 +236,6 @@ namespace raw {
                 /* The following operation should logically be inside the previous if branch. Note that `mask_offset`
                 * is only used by lane zero threads. Hence, there is no harm in executing it other threads as it is
                 * unused there.
-
                 *
                 * Keeping it inside prevents the compiler from treating it as a constexpr addition to the address in
                 * successive unrolled iterations. A register is used and instructions are emitted to multiply the
