@@ -196,7 +196,7 @@ public:
         _locPredTransposed = getParameter<bool>(params, "loc_pred_transposed", 0, false, false);
         _bboxesNormalized = getParameter<bool>(params, "normalized_bbox", 0, false, true);
         _clip = getParameter<bool>(params, "clip", 0, false, false);
-        _groupByClasses = getParameter<bool>(params, "group_by_classes", 0, false, true);
+        _groupByClasses = getParameter<bool>(params, "group_by_classes", 0, false, false);
 
         getCodeType(params);
 
