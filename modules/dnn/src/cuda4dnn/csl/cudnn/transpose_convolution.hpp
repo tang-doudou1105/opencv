@@ -35,6 +35,38 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
             const TensorDescriptor<T>& input,
             const TensorDescriptor<T>& output)
         {
+#if CUDNN_MAJOR >= 8
+            int requestedAlgoCount = 0, returnedAlgoCount = 0;
+            CUDA4DNN_CHECK_CUDNN(cudnnGetConvolutionBackwardDataAlgorithmMaxCount(handle.get(), &requestedAlgoCount));
+            std::vector<cudnnConvolutionBwdDataAlgoPerf_t> results(requestedAlgoCount);
+            CUDA4DNN_CHECK_CUDNN(
+                cudnnGetConvolutionBackwardDataAlgorithm_v7(
+                    handle.get(),
+                    filter.get(), input.get(), conv.get(), output.get(),
+                    requestedAlgoCount,
+                    &returnedAlgoCount,
+                    &results[0]
+                )
+            );
+
+            size_t free_memory, total_memory;
+            CUDA4DNN_CHECK_CUDA(cudaMemGetInfo(&free_memory, &total_memory));
+
+            bool found_conv_algorithm = false;
+            for (int i = 0; i < returnedAlgoCount; i++)
+            {
+                if (results[i].status == CUDNN_STATUS_SUCCESS && results[i].memory < free_memory)
+                {
+                    found_conv_algorithm = true;
+                    dalgo = results[i].algo;
+                    workspace_size = results[i].memory;
+                    break;
+                }
+            }
+
+            if (!found_conv_algorithm)
+                CV_Error (cv::Error::GpuApiCallError, "cuDNN did not return a suitable algorithm for transpose convolution.");
+#else
             CUDA4DNN_CHECK_CUDNN(
                 cudnnGetConvolutionBackwardDataAlgorithm(
                     handle.get(),
@@ -52,6 +84,7 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
                     dalgo, &workspace_size
                 )
             );
+#endif
         }
 
         TransposeConvolutionAlgorithm& operator=(const TransposeConvolutionAlgorithm&) = default;
