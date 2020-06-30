@@ -1545,6 +1545,7 @@ public:
         if (countNonZero(biasMat) == 0)
             biasMat = Mat();
 
+        std::cout << Layer::name << ' ' << Layer::type << std::endl;
         return make_cuda_node<cuda4dnn::ConvolutionOp>(
             preferableTarget, std::move(context->stream), std::move(context->cudnn_handle), config, filtersMat, biasMat);
     }

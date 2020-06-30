@@ -267,7 +267,6 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
             const TensorDescriptor<T>& input,
             const TensorDescriptor<T>& output)
         {
-#if CUDNN_MAJOR >= 8
             int requestedAlgoCount = 0, returnedAlgoCount = 0;
             CUDA4DNN_CHECK_CUDNN(cudnnGetConvolutionForwardAlgorithmMaxCount(handle.get(), &requestedAlgoCount));
             std::vector<cudnnConvolutionFwdAlgoPerf_t> results(requestedAlgoCount);
@@ -298,25 +297,31 @@ namespace cv { namespace dnn { namespace cuda4dnn { namespace csl { namespace cu
 
             if (!found_conv_algorithm)
                 CV_Error (cv::Error::GpuApiCallError, "cuDNN did not return a suitable algorithm for convolution.");
-#else
+
+            cudnnConvolutionFwdAlgo_t algo2;
             CUDA4DNN_CHECK_CUDNN(
                 cudnnGetConvolutionForwardAlgorithm(
                     handle.get(),
                     input.get(), filter.get(), conv.get(), output.get(),
                     CUDNN_CONVOLUTION_FWD_PREFER_FASTEST,
                     0, /* no memory limit */
-                    &algo
+                    &algo2
                 )
             );
 
+            size_t workspace_size2;
             CUDA4DNN_CHECK_CUDNN(
                 cudnnGetConvolutionForwardWorkspaceSize(
                     handle.get(),
                     input.get(), filter.get(), conv.get(), output.get(),
-                    algo, &workspace_size
+                    algo2, &workspace_size2
                 )
             );
-#endif
+
+            if (algo != algo2 || workspace_size != workspace_size2)
+            {
+                std::cout << "MISMATCH " << algo << ' ' << algo2 << ' ' << workspace_size << ' ' << workspace_size2 << std::endl;
+            }
         }
 
         ConvolutionAlgorithm& operator=(const ConvolutionAlgorithm&) = default;
